@@ -134,7 +134,7 @@ kfold_cv_lm <- function(formula, data, k = 10, seed = 302) {
 # 1. Load and Clean Data
 
 ```{r data-cleaning, include=FALSE}
-df <- read.csv("data/original_data.csv")
+df <- read.csv("original_data.csv")
 
 # Select variables used in the analysis
 
