@@ -1,0 +1,945 @@
+---
+title: "Airbnb Pricing Analysis in Hawaii"
+author: "Frank Cao"
+output: html_document
+---
+
+# 0. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+
+options(scipen = 999)
+
+# Helper functions
+
+clean_blank_to_na <- function(x) {
+  x_char <- trimws(as.character(x))
+  x_char[x_char == ""] <- NA
+  x_char
+}
+
+coef_to_percent <- function(beta) {
+  100 * (exp(beta) - 1)
+}
+
+model_metrics <- function(model, model_name) {
+  data.frame(
+    Model = model_name,
+    N = nobs(model),
+    Num_Coefficients = length(coef(model)),
+    Residual_SE = round(summary(model)$sigma, 4),
+    R2 = round(summary(model)$r.squared, 4),
+    Adjusted_R2 = round(summary(model)$adj.r.squared, 4),
+    AIC = round(AIC(model), 2),
+    BIC = round(BIC(model), 2),
+    RSS = round(sum(resid(model)^2), 2),
+    row.names = NULL
+  )
+}
+
+compare_models <- function(model_list) {
+  out <- do.call(
+    rbind,
+    Map(model_metrics, model_list, names(model_list))
+  )
+  rownames(out) <- NULL
+  out
+}
+
+tidy_coef_table <- function(model) {
+  coef_sum <- summary(model)$coefficients
+  conf_int <- confint(model)
+
+  data.frame(
+    Predictor = rownames(coef_sum),
+    Estimate = coef_sum[, "Estimate"],
+    Std_Error = coef_sum[, "Std. Error"],
+    CI_Lower = conf_int[, 1],
+    CI_Upper = conf_int[, 2],
+    P_value = coef_sum[, "Pr(>|t|)"],
+    row.names = NULL
+  )
+}
+
+influence_summary_table <- function(model) {
+  n <- nobs(model)
+  k <- length(coef(model))
+
+  standardized_residuals <- rstandard(model)
+  leverage_values <- hatvalues(model)
+  cooks_values <- cooks.distance(model)
+
+  data.frame(
+    Diagnostic = c(
+      "|standardized residual| > 4",
+      "Leverage > 2k/n",
+      "Cook's distance > 4/n",
+      "Cook's distance > 1"
+    ),
+    Cutoff = c(
+      4,
+      2 * k / n,
+      4 / n,
+      1
+    ),
+    Count = c(
+      sum(abs(standardized_residuals) > 4),
+      sum(leverage_values > 2 * k / n),
+      sum(cooks_values > 4 / n),
+      sum(cooks_values > 1)
+    ),
+    row.names = NULL
+  )
+}
+
+kfold_cv_lm <- function(formula, data, k = 10, seed = 302) {
+  set.seed(seed)
+
+  n <- nrow(data)
+  fold_id <- sample(rep(seq_len(k), length.out = n))
+
+  fold_results <- lapply(seq_len(k), function(j) {
+    train_data <- data[fold_id != j, ]
+    test_data <- data[fold_id == j, ]
+
+    fit_j <- lm(formula, data = train_data)
+    pred_j <- predict(fit_j, newdata = test_data)
+
+    data.frame(
+      Fold = j,
+      MSE = mean((test_data$log_price - pred_j)^2),
+      RMSE = sqrt(mean((test_data$log_price - pred_j)^2)),
+      MAE = mean(abs(test_data$log_price - pred_j))
+    )
+  })
+
+  fold_results <- do.call(rbind, fold_results)
+
+  data.frame(
+    CV_MSE = mean(fold_results$MSE),
+    CV_RMSE = mean(fold_results$RMSE),
+    CV_MAE = mean(fold_results$MAE),
+    SD_RMSE = sd(fold_results$RMSE),
+    row.names = NULL
+  )
+}
+```
+
+# 1. Load and Clean Data
+
+```{r data-cleaning, include=FALSE}
+df <- read.csv("data/original_data.csv")
+
+# Select variables used in the analysis
+
+airbnb <- df[, c(
+  "price",
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "room_type",
+  "neighbourhood_cleansed",
+  "minimum_nights",
+  "availability_365",
+  "number_of_reviews",
+  "reviews_per_month",
+  "review_scores_rating",
+  "review_scores_location",
+  "review_scores_cleanliness",
+  "host_is_superhost",
+  "host_identity_verified",
+  "instant_bookable",
+  "calculated_host_listings_count"
+)]
+
+# Clean price and create log price
+
+airbnb$price_num <- as.numeric(gsub("[$,]", "", airbnb$price))
+airbnb$log_price <- log(airbnb$price_num)
+
+airbnb <- airbnb[!is.na(airbnb$price_num), ]
+airbnb <- airbnb[airbnb$price_num > 0, ]
+
+# Remove extreme bedroom and bathroom values
+
+airbnb <- airbnb[is.na(airbnb$bedrooms) | airbnb$bedrooms <= 10, ]
+airbnb <- airbnb[is.na(airbnb$bathrooms) | airbnb$bathrooms <= 10, ]
+
+# Restrict the nightly prices
+
+airbnb <- airbnb[airbnb$price_num >= 50 & airbnb$price_num <= 3000, ]
+
+# Clean categorical variables
+
+categorical_vars <- c(
+  "host_is_superhost",
+  "host_identity_verified",
+  "instant_bookable",
+  "room_type",
+  "neighbourhood_cleansed"
+)
+
+for (v in categorical_vars) {
+  airbnb[[v]] <- clean_blank_to_na(airbnb[[v]])
+  airbnb[[v]] <- as.factor(airbnb[[v]])
+}
+
+airbnb$host_is_superhost <- factor(
+  airbnb$host_is_superhost,
+  levels = c("f", "t")
+)
+
+airbnb$host_identity_verified <- factor(
+  airbnb$host_identity_verified,
+  levels = c("f", "t")
+)
+
+airbnb$instant_bookable <- factor(
+  airbnb$instant_bookable,
+  levels = c("f", "t")
+)
+
+airbnb$room_type <- relevel(
+  airbnb$room_type,
+  ref = "Entire home/apt"
+)
+
+# Preliminary model dataset
+
+model_data <- airbnb[, c(
+  "log_price",
+  "price_num",
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "minimum_nights",
+  "review_scores_rating",
+  "host_is_superhost",
+  "room_type",
+  "neighbourhood_cleansed"
+)]
+
+model_data <- na.omit(model_data)
+model_data$log_minimum_nights <- log(model_data$minimum_nights)
+
+# Extended dataset for model selection
+
+model_vars_extended <- c(
+  "log_price",
+  "price_num",
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "minimum_nights",
+  "availability_365",
+  "number_of_reviews",
+  "reviews_per_month",
+  "review_scores_rating",
+  "review_scores_location",
+  "review_scores_cleanliness",
+  "host_is_superhost",
+  "host_identity_verified",
+  "instant_bookable",
+  "calculated_host_listings_count",
+  "room_type",
+  "neighbourhood_cleansed"
+)
+
+model_data_extended <- airbnb[, model_vars_extended]
+
+for (v in categorical_vars) {
+  model_data_extended[[v]] <- clean_blank_to_na(model_data_extended[[v]])
+}
+
+model_data_extended <- na.omit(model_data_extended)
+
+model_data_extended$log_number_of_reviews <- log(model_data_extended$number_of_reviews + 1)
+model_data_extended$log_reviews_per_month <- log(model_data_extended$reviews_per_month + 1)
+model_data_extended$log_host_listings <- log(model_data_extended$calculated_host_listings_count + 1)
+model_data_extended$log_minimum_nights <- log(model_data_extended$minimum_nights)
+
+for (v in categorical_vars) {
+  model_data_extended[[v]] <- droplevels(as.factor(model_data_extended[[v]]))
+}
+```
+
+# 2. Exploratory Analysis
+
+```{r exploratory-summary, include=FALSE}
+# Numerical summaries
+
+numerical_summary <- summary(model_data[, c(
+  "log_price",
+  "price_num",
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "minimum_nights",
+  "log_minimum_nights",
+  "review_scores_rating"
+)])
+
+size_correlations <- cor(model_data[, c(
+  "accommodates",
+  "bedrooms",
+  "bathrooms"
+)])
+
+room_type_counts <- table(model_data$room_type)
+superhost_counts <- table(model_data$host_is_superhost)
+neighbourhood_counts <- table(model_data$neighbourhood_cleansed)
+```
+
+```{r exploratory-plot-log-price, fig.width=7, fig.height=5}
+hist(
+  model_data$log_price,
+  main = "Histogram of Log Nightly Price",
+  xlab = "Log Nightly Price",
+  breaks = 40
+)
+```
+
+```{r exploratory-plot-capacity, fig.width=8, fig.height=5}
+boxplot(
+  log_price ~ accommodates,
+  data = model_data,
+  main = "Log Price vs Number of Guests Accommodated",
+  xlab = "Number of Guests Accommodated",
+  ylab = "Log Nightly Price"
+)
+```
+
+```{r exploratory-plot-room-type, fig.width=8, fig.height=5}
+boxplot(
+  log_price ~ room_type,
+  data = model_data,
+  main = "Log Price vs Room Type",
+  xlab = "Room Type",
+  ylab = "Log Nightly Price"
+)
+```
+
+# 3. Preliminary Model
+
+```{r preliminary-model, include=FALSE}
+formula_preliminary_original <- log_price ~ accommodates + bedrooms + bathrooms +
+  minimum_nights + review_scores_rating +
+  host_is_superhost + room_type + neighbourhood_cleansed
+
+fit_preliminary_original <- lm(
+  formula_preliminary_original,
+  data = model_data
+)
+
+preliminary_metrics <- model_metrics(
+  fit_preliminary_original,
+  "Preliminary model"
+)
+
+preliminary_fitted <- fitted(fit_preliminary_original)
+preliminary_residuals <- resid(fit_preliminary_original)
+preliminary_standardized_residuals <- rstandard(fit_preliminary_original)
+```
+
+# 4. Model Selection
+
+```{r model-selection, include=FALSE}
+# Define model formulas
+
+formula_prelim <- log_price ~ accommodates + bedrooms + bathrooms +
+  minimum_nights + review_scores_rating +
+  host_is_superhost + room_type + neighbourhood_cleansed
+
+formula_log_min <- log_price ~ accommodates + bedrooms + bathrooms +
+  log_minimum_nights + review_scores_rating +
+  host_is_superhost + room_type + neighbourhood_cleansed
+
+formula_no_min <- log_price ~ accommodates + bedrooms + bathrooms +
+  review_scores_rating +
+  host_is_superhost + room_type + neighbourhood_cleansed
+
+formula_interaction <- log_price ~ accommodates * room_type +
+  bedrooms + bathrooms +
+  minimum_nights + review_scores_rating +
+  host_is_superhost + neighbourhood_cleansed
+
+formula_extended <- log_price ~ accommodates * room_type +
+  bedrooms + bathrooms +
+  minimum_nights +
+  availability_365 +
+  log_number_of_reviews +
+  log_reviews_per_month +
+  review_scores_rating +
+  review_scores_location +
+  review_scores_cleanliness +
+  host_is_superhost +
+  host_identity_verified +
+  instant_bookable +
+  log_host_listings +
+  neighbourhood_cleansed
+
+# Fit candidate models
+
+fit_prelim_ext <- lm(formula_prelim, data = model_data_extended)
+fit_log_min_ext <- lm(formula_log_min, data = model_data_extended)
+fit_no_min_ext <- lm(formula_no_min, data = model_data_extended)
+fit_interaction_ext <- lm(formula_interaction, data = model_data_extended)
+fit_extended <- lm(formula_extended, data = model_data_extended)
+
+# Transformation and interaction
+
+transformation_models <- list(
+  "Raw minimum nights" = fit_prelim_ext,
+  "Log minimum nights" = fit_log_min_ext,
+  "No minimum nights" = fit_no_min_ext
+)
+
+transformation_comparison <- compare_models(transformation_models)
+
+candidate_models <- list(
+  "Preliminary model" = fit_prelim_ext,
+  "Interaction model" = fit_interaction_ext,
+  "Full extended model" = fit_extended
+)
+
+candidate_model_comparison <- compare_models(candidate_models)
+
+test_minimum_nights <- anova(fit_no_min_ext, fit_prelim_ext)
+test_interaction <- anova(fit_prelim_ext, fit_interaction_ext)
+test_extended_predictors <- anova(fit_interaction_ext, fit_extended)
+
+# Multicollinearity
+
+if (requireNamespace("car", quietly = TRUE)) {
+  vif_values <- car::vif(fit_extended)
+
+  if (is.matrix(vif_values)) {
+    vif_table <- data.frame(
+      Predictor = rownames(vif_values),
+      GVIF = vif_values[, "GVIF"],
+      Df = vif_values[, "Df"],
+      Adjusted_GVIF = vif_values[, "GVIF^(1/(2*Df))"],
+      row.names = NULL
+    )
+  } else {
+    vif_table <- data.frame(
+      Predictor = names(vif_values),
+      VIF = as.numeric(vif_values),
+      row.names = NULL
+    )
+  }
+} else {
+  vif_table <- data.frame(
+    Message = "Package 'car' is not installed"
+  )
+}
+
+# Influence and sensitivity analysis
+
+influence_counts_extended <- influence_summary_table(fit_extended)
+
+standardized_residuals_ext <- rstandard(fit_extended)
+leverage_ext <- hatvalues(fit_extended)
+cooks_ext <- cooks.distance(fit_extended)
+
+influence_details <- data.frame(
+  row_id = seq_len(nrow(model_data_extended)),
+  price_num = model_data_extended$price_num,
+  log_price = model_data_extended$log_price,
+  accommodates = model_data_extended$accommodates,
+  bedrooms = model_data_extended$bedrooms,
+  bathrooms = model_data_extended$bathrooms,
+  minimum_nights = model_data_extended$minimum_nights,
+  room_type = model_data_extended$room_type,
+  neighbourhood_cleansed = model_data_extended$neighbourhood_cleansed,
+  standardized_residual = standardized_residuals_ext,
+  leverage = leverage_ext,
+  cooks_distance = cooks_ext
+)
+
+top_influential <- head(
+  influence_details[order(-influence_details$cooks_distance), ],
+  10
+)
+
+model_data_no_high_cook <- model_data_extended[cooks_ext <= 0.01, ]
+
+fit_extended_no_high_cook <- lm(
+  formula_extended,
+  data = model_data_no_high_cook
+)
+
+sensitivity_comparison <- compare_models(
+  list(
+    "Full extended model" = fit_extended,
+    "Without Cook > 0.01" = fit_extended_no_high_cook
+  )
+)
+
+main_terms <- c(
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "minimum_nights",
+  "log_number_of_reviews",
+  "log_reviews_per_month",
+  "review_scores_location",
+  "review_scores_cleanliness",
+  "host_is_superhostt",
+  "host_identity_verifiedt"
+)
+
+main_terms <- main_terms[main_terms %in% names(coef(fit_extended))]
+
+coef_sensitivity <- data.frame(
+  Term = main_terms,
+  Full_Model = coef(fit_extended)[main_terms],
+  Sensitivity_Model = coef(fit_extended_no_high_cook)[main_terms],
+  row.names = NULL
+)
+
+coef_sensitivity$Difference <- coef_sensitivity$Sensitivity_Model -
+  coef_sensitivity$Full_Model
+
+# AIC/BIC stepwise selection
+
+fit_step_aic <- step(
+  fit_extended,
+  direction = "both",
+  trace = FALSE
+)
+
+fit_step_bic <- step(
+  fit_extended,
+  direction = "both",
+  k = log(nobs(fit_extended)),
+  trace = FALSE
+)
+
+stepwise_models <- list(
+  "Preliminary model" = fit_prelim_ext,
+  "Interaction model" = fit_interaction_ext,
+  "Full extended model" = fit_extended,
+  "AIC stepwise model" = fit_step_aic,
+  "BIC stepwise detailed model" = fit_step_bic
+)
+
+stepwise_comparison <- compare_models(stepwise_models)
+
+# Final selected model
+
+final_fit <- fit_step_bic
+
+final_model_metrics <- model_metrics(
+  final_fit,
+  "Final selected BIC detailed model"
+)
+
+coef_table <- tidy_coef_table(final_fit)
+```
+
+# 5. Model Validation
+
+```{r model-validation, include=FALSE}
+validation_formulas <- list(
+  "Preliminary model" = formula(fit_prelim_ext),
+  "Interaction model" = formula(fit_interaction_ext),
+  "Full extended model" = formula(fit_extended),
+  "Final BIC detailed model" = formula(final_fit)
+)
+
+cv_results <- do.call(
+  rbind,
+  Map(
+    function(model_formula, model_name) {
+      out <- kfold_cv_lm(
+        formula = model_formula,
+        data = model_data_extended,
+        k = 10,
+        seed = 302
+      )
+
+      out$Model <- model_name
+      out
+    },
+    validation_formulas,
+    names(validation_formulas)
+  )
+)
+
+cv_results <- cv_results[, c(
+  "Model",
+  "CV_MSE",
+  "CV_RMSE",
+  "CV_MAE",
+  "SD_RMSE"
+)]
+
+cv_results[, -1] <- round(cv_results[, -1], 4)
+```
+
+```{r ml-benchmarks, include=FALSE}
+
+# Supplementary predictive benchmark only.
+# Requires optional packages: FNN, ranger, xgboost.
+# If a package is not installed, the corresponding method is skipped.
+# This chunk may take several minutes to run.
+
+set.seed(302)
+
+x_matrix <- model.matrix(formula(final_fit), data = model_data_extended)[, -1]
+y <- model_data_extended$log_price
+x_scaled <- scale(x_matrix)
+
+n <- nrow(model_data_extended)
+k_folds <- 10
+fold_id <- sample(rep(seq_len(k_folds), length.out = n))
+
+linear_row <- cv_results[
+  cv_results$Model == "Final BIC detailed model",
+]
+
+benchmark_results <- data.frame(
+  Model = "Final BIC detailed linear model",
+  CV_RMSE = linear_row$CV_RMSE,
+  CV_MAE = linear_row$CV_MAE,
+  SD_RMSE = linear_row$SD_RMSE
+)
+
+if (requireNamespace("FNN", quietly = TRUE)) {
+  candidate_k <- c(5, 10, 25, 50, 100)
+
+  knn_cv_results <- do.call(
+    rbind,
+    lapply(candidate_k, function(k_value) {
+      fold_results <- do.call(
+        rbind,
+        lapply(seq_len(k_folds), function(j) {
+          train_index <- fold_id != j
+          test_index <- fold_id == j
+
+          knn_fit <- FNN::knn.reg(
+            train = x_scaled[train_index, ],
+            test = x_scaled[test_index, ],
+            y = y[train_index],
+            k = k_value
+          )
+
+          pred <- knn_fit$pred
+
+          data.frame(
+            RMSE = sqrt(mean((y[test_index] - pred)^2)),
+            MAE = mean(abs(y[test_index] - pred))
+          )
+        })
+      )
+
+      data.frame(
+        Model = paste0("KNN regression, k = ", k_value),
+        CV_RMSE = mean(fold_results$RMSE),
+        CV_MAE = mean(fold_results$MAE),
+        SD_RMSE = sd(fold_results$RMSE)
+      )
+    })
+  )
+
+  best_knn <- knn_cv_results[
+    which.min(knn_cv_results$CV_RMSE),
+  ]
+
+  benchmark_results <- rbind(
+    benchmark_results,
+    best_knn
+  )
+}
+
+if (requireNamespace("ranger", quietly = TRUE)) {
+  rf_formula <- log_price ~
+    accommodates +
+    bedrooms +
+    bathrooms +
+    minimum_nights +
+    log_number_of_reviews +
+    log_reviews_per_month +
+    review_scores_location +
+    review_scores_cleanliness +
+    host_is_superhost +
+    host_identity_verified +
+    room_type +
+    neighbourhood_cleansed
+
+  rf_fold_results <- do.call(
+    rbind,
+    lapply(seq_len(k_folds), function(j) {
+      train_data <- model_data_extended[fold_id != j, ]
+      test_data <- model_data_extended[fold_id == j, ]
+
+      rf_fit <- ranger::ranger(
+        formula = rf_formula,
+        data = train_data,
+        num.trees = 300,
+        mtry = 4,
+        min.node.size = 10,
+        seed = 302
+      )
+
+      pred <- predict(rf_fit, data = test_data)$predictions
+
+      data.frame(
+        RMSE = sqrt(mean((test_data$log_price - pred)^2)),
+        MAE = mean(abs(test_data$log_price - pred))
+      )
+    })
+  )
+
+  rf_cv_results <- data.frame(
+    Model = "Random forest",
+    CV_RMSE = mean(rf_fold_results$RMSE),
+    CV_MAE = mean(rf_fold_results$MAE),
+    SD_RMSE = sd(rf_fold_results$RMSE)
+  )
+
+  benchmark_results <- rbind(
+    benchmark_results,
+    rf_cv_results
+  )
+}
+
+if (requireNamespace("xgboost", quietly = TRUE)) {
+  xgb_fold_results <- do.call(
+    rbind,
+    lapply(seq_len(k_folds), function(j) {
+      train_index <- fold_id != j
+      test_index <- fold_id == j
+
+      dtrain <- xgboost::xgb.DMatrix(
+        data = x_matrix[train_index, ],
+        label = y[train_index]
+      )
+
+      dtest <- xgboost::xgb.DMatrix(
+        data = x_matrix[test_index, ],
+        label = y[test_index]
+      )
+
+      xgb_fit <- xgboost::xgb.train(
+        params = list(
+          objective = "reg:squarederror",
+          eval_metric = "rmse",
+          max_depth = 3,
+          eta = 0.05,
+          subsample = 0.8,
+          colsample_bytree = 0.8,
+          nthread = 2
+        ),
+        data = dtrain,
+        nrounds = 150,
+        verbose = 0
+      )
+
+      pred <- predict(xgb_fit, dtest)
+
+      data.frame(
+        RMSE = sqrt(mean((y[test_index] - pred)^2)),
+        MAE = mean(abs(y[test_index] - pred))
+      )
+    })
+  )
+
+  xgb_cv_results <- data.frame(
+    Model = "Gradient boosting",
+    CV_RMSE = mean(xgb_fold_results$RMSE),
+    CV_MAE = mean(xgb_fold_results$MAE),
+    SD_RMSE = sd(xgb_fold_results$RMSE)
+  )
+
+  benchmark_results <- rbind(
+    benchmark_results,
+    xgb_cv_results
+  )
+}
+
+benchmark_results$CV_RMSE <- round(benchmark_results$CV_RMSE, 4)
+benchmark_results$CV_MAE <- round(benchmark_results$CV_MAE, 4)
+benchmark_results$SD_RMSE <- round(benchmark_results$SD_RMSE, 4)
+```
+
+# 6. Final Report Tables and Figures
+
+```{r selected-coefficient-table, include=FALSE}
+selected_terms <- c(
+  "accommodates",
+  "bedrooms",
+  "bathrooms",
+  "minimum_nights",
+  "log_number_of_reviews",
+  "log_reviews_per_month",
+  "review_scores_location",
+  "review_scores_cleanliness",
+  "host_is_superhostt",
+  "host_identity_verifiedt"
+)
+
+selected_coef_table <- coef_table[
+  coef_table$Predictor %in% selected_terms,
+]
+
+selected_coef_table <- selected_coef_table[
+  match(selected_terms, selected_coef_table$Predictor),
+]
+
+selected_coef_table$Predictor <- c(
+  "Accommodates",
+  "Bedrooms",
+  "Bathrooms",
+  "Minimum nights",
+  "Log number of reviews",
+  "Log reviews per month",
+  "Review score for location",
+  "Review score for cleanliness",
+  "Superhost",
+  "Host identity verified"
+)
+
+selected_coef_table$Approx_Price_Change <- round(
+  coef_to_percent(selected_coef_table$Estimate),
+  1
+)
+
+selected_coef_table$Estimate <- round(selected_coef_table$Estimate, 4)
+selected_coef_table$Std_Error <- round(selected_coef_table$Std_Error, 4)
+selected_coef_table$CI_Lower <- round(selected_coef_table$CI_Lower, 4)
+selected_coef_table$CI_Upper <- round(selected_coef_table$CI_Upper, 4)
+selected_coef_table$P_value <- signif(selected_coef_table$P_value, 3)
+
+selected_coef_table <- selected_coef_table[, c(
+  "Predictor",
+  "Estimate",
+  "Std_Error",
+  "CI_Lower",
+  "CI_Upper",
+  "P_value",
+  "Approx_Price_Change"
+)]
+```
+
+```{r capacity-effects-table, include=FALSE}
+capacity_effects <- data.frame(
+  Room_Type = c(
+    "Entire home/apt",
+    "Hotel room",
+    "Private room",
+    "Shared room"
+  ),
+  Log_Effect = c(
+    coef(final_fit)["accommodates"],
+    coef(final_fit)["accommodates"] +
+      coef(final_fit)["accommodates:room_typeHotel room"],
+    coef(final_fit)["accommodates"] +
+      coef(final_fit)["accommodates:room_typePrivate room"],
+    coef(final_fit)["accommodates"] +
+      coef(final_fit)["accommodates:room_typeShared room"]
+  ),
+  row.names = NULL
+)
+
+capacity_effects$Approx_Price_Change <- round(
+  coef_to_percent(capacity_effects$Log_Effect),
+  1
+)
+
+capacity_effects$Log_Effect <- round(capacity_effects$Log_Effect, 4)
+```
+
+```{r table-model-comparison}
+knitr::kable(
+  stepwise_comparison,
+  caption = "Model comparison for candidate regression models"
+)
+```
+
+```{r table-selected-coefficients}
+knitr::kable(
+  selected_coef_table,
+  caption = "Selected coefficient estimates from the final BIC detailed model"
+)
+```
+
+```{r table-capacity-effects}
+knitr::kable(
+  capacity_effects,
+  caption = "Room-type-specific effect of one additional accommodated guest"
+)
+```
+
+```{r table-cross-validation}
+knitr::kable(
+  cv_results,
+  caption = "10-fold cross-validation results"
+)
+```
+
+```{r table-ml-benchmark}
+knitr::kable(
+  benchmark_results,
+  caption = "Supplementary predictive benchmark results"
+)
+```
+
+```{r final-diagnostic-panel, fig.width=10, fig.height=7}
+par(mfrow = c(2, 2),
+    mar = c(4.2, 4.2, 3, 1),
+    oma = c(0, 0, 2, 0))
+
+plot(
+  fitted(final_fit),
+  resid(final_fit),
+  main = "Residuals vs Fitted",
+  xlab = "Fitted Values",
+  ylab = "Residuals",
+  pch = 16,
+  cex = 0.35
+)
+abline(h = 0, lty = 2)
+
+plot(
+  fitted(final_fit),
+  rstandard(final_fit),
+  main = "Standardized Residuals vs Fitted",
+  xlab = "Fitted Values",
+  ylab = "Standardized Residuals",
+  pch = 16,
+  cex = 0.35
+)
+abline(h = 0, lty = 2)
+
+hist(
+  rstandard(final_fit),
+  main = "Histogram of Standardized Residuals",
+  xlab = "Standardized Residuals",
+  breaks = 40
+)
+
+qqnorm(
+  rstandard(final_fit),
+  main = "Normal Q-Q Plot",
+  pch = 16,
+  cex = 0.35
+)
+qqline(rstandard(final_fit), lty = 2)
+
+mtext(
+  "Residual Diagnostic Plots for Final Model",
+  outer = TRUE,
+  cex = 1.2,
+  font = 2
+)
+
+par(mfrow = c(1, 1))
+```
