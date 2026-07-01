@@ -36,8 +36,6 @@ In particular, the project examines whether larger listings and entire-home room
 .
 ├── README.md
 ├── airbnb_hawaii_pricing_analysis.Rmd
-├── data/
-│   └── README.md
 └── .gitignore
 ```
 
@@ -49,16 +47,18 @@ The original raw Airbnb data was obtained from Inside Airbnb:
 
 The raw dataset is not included in this repository because the file is too large for direct upload to GitHub.
 
-To reproduce the analysis, download the Hawaii raw listings dataset from Inside Airbnb, place it inside the `data/` folder, and rename it as:
+To reproduce the analysis, download the Hawaii raw listings dataset from Inside Airbnb and rename it as:
 
 ```text
 original_data.csv
 ```
 
+Place `original_data.csv` in the same folder as `airbnb_hawaii_pricing_analysis.Rmd`.
+
 The R Markdown file expects the data file to be located at:
 
 ```text
-data/original_data.csv
+original_data.csv
 ```
 
 ## Methods
@@ -82,8 +82,8 @@ Review quality, location-related variables, and host reputation also help explai
 To reproduce the analysis:
 
 1. Download the Hawaii listings dataset from Inside Airbnb.
-2. Place the raw CSV file inside the `data/` folder.
-3. Rename the file as `original_data.csv`.
+2. Rename the raw CSV file as `original_data.csv`.
+3. Place `original_data.csv` in the same folder as `airbnb_hawaii_pricing_analysis.Rmd`.
 4. Open `airbnb_hawaii_pricing_analysis.Rmd` in RStudio.
 5. Knit the R Markdown file.
 
